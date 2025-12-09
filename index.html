@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AI Route Rationalization — Alternatives + Signals + Heatmap</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body { margin:0; font-family: Arial; }
+    header { background:#0c4a6e; color:white; padding:12px; text-align:center; font-size:18px; }
+    #controls { padding:8px; display:flex; gap:8px; background:#fafafa; align-items:center; flex-wrap:wrap; }
+    input, select, button { padding:8px; font-size:14px; }
+    #map { height:70vh; }
+    #routes{ width:360px; max-height:44vh; overflow:auto; padding:8px; }
+    .route-card{ border:1px solid #ddd; padding:8px; margin-bottom:8px; border-radius:4px; background:#fff; }
+  </style>
+</head>
+<body>
+  <header>AI Route Rationalization — Alternatives + Signals + Heatmap</header>
+
+  <div id="controls">
+    <input id="startPlace" placeholder="Start place e.g. Vijayapura Karnataka" style="width:300px">
+    <input id="endPlace" placeholder="End place e.g. Bengaluru Karnataka" style="width:300px">
+    <select id="mode"><option value="fastest">Fastest</option><option value="shortest">Shortest</option><option value="fuel">Fuel Efficient</option></select>
+    <button onclick="getRoutes()">Get Alternatives</button>
+    <div id="status" style="margin-left:10px;color:#333"></div>
+  </div>
+
+  <div style="display:flex;">
+    <div id="map" style="flex:1"></div>
+    <div id="routes"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+
+<script>
+const BACKEND = "http://127.0.0.1:5000";
+const map = L.map('map').setView([15.2, 75.0], 6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+let routeLayers = [], routeSignalLayers = [], citySignalLayers = [], heatLayer = null;
+
+function clearAll() {
+  routeLayers.forEach(l=>map.removeLayer(l)); routeLayers=[];
+  routeSignalLayers.forEach(l=>map.removeLayer(l)); routeSignalLayers=[];
+  citySignalLayers.forEach(l=>map.removeLayer(l)); citySignalLayers=[];
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer=null; }
+  document.getElementById("routes").innerHTML = "";
+}
+
+function parseGeometry(geom) {
+  if (!geom) return [];
+  try {
+    if (geom.type === "LineString" && Array.isArray(geom.coordinates)) return geom.coordinates.map(c => [c[1], c[0]]);
+    if (Array.isArray(geom.coordinates)) return geom.coordinates.map(c => [c[1], c[0]]);
+    if (geom.features && geom.features[0] && geom.features[0].geometry && Array.isArray(geom.features[0].geometry.coordinates)) return geom.features[0].geometry.coordinates.map(c => [c[1], c[0]]);
+    if (Array.isArray(geom) && Array.isArray(geom[0]) && geom[0].length >= 2) return geom.map(c => [c[1], c[0]]);
+  } catch(e) { console.error("parseGeometry", e); }
+  return [];
+}
+
+function colorByAccuracy(acc) {
+  if (acc >= 80) return "green";
+  if (acc >= 60) return "orange";
+  return "red";
+}
+
+function addRouteSignals(latlngs, intensity) {
+  if (!latlngs || latlngs.length === 0) return;
+  const step = Math.max(1, Math.floor(latlngs.length / 8));
+  for (let i = step; i < latlngs.length; i += step) {
+    const pos = latlngs[i];
+    const col = intensity > 70 ? "red" : (intensity > 45 ? "orange" : "green");
+    const m = L.circleMarker(pos, { radius:6, color:col, fillColor:col, fillOpacity:1 }).addTo(map);
+    routeSignalLayers.push(m);
+  }
+}
+
+function addCitySignals(signals) {
+  signals.forEach(s => {
+    const col = s.intensity > 70 ? "red" : (s.intensity > 45 ? "orange" : "green");
+    const m = L.circleMarker([s.lat, s.lng], { radius:5, color:col, fillColor:col, fillOpacity:0.9 }).addTo(map);
+    m.bindPopup(`Signal intensity: ${s.intensity}`);
+    citySignalLayers.push(m);
+  });
+}
+
+function drawHeat(heatPoints) {
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer=null; }
+  if (!heatPoints || heatPoints.length === 0) return;
+  heatLayer = L.heatLayer(heatPoints, {radius:25, blur:18, maxZoom:12}).addTo(map);
+}
+
+async function getRoutes() {
+  clearAll();
+  document.getElementById("status").textContent = "Computing routes...";
+  const startPlace = document.getElementById("startPlace").value.trim();
+  const endPlace = document.getElementById("endPlace").value.trim();
+  const mode = document.getElementById("mode").value;
+  if (!startPlace || !endPlace) { alert("Enter start & end"); document.getElementById("status").textContent=""; return; }
+
+  try {
+    const res = await fetch(BACKEND + "/optimize-route", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ start_place: startPlace, end_place: endPlace, mode })
+    });
+    const data = await res.json();
+    document.getElementById("status").textContent = "";
+    if (data.error) { alert(data.error); return; }
+
+    const routes = data.routes || [];
+    const route_signals = data.route_signals || [];
+    const city_signals = data.city_signals || [];
+    const heat_points = data.heat_points || [];
+
+    routes.forEach((r, idx) => {
+      const coords = parseGeometry(r.geometry);
+      if (!coords || coords.length === 0) return;
+      const acc = r.accuracy_pct || r.score || 60;
+      const color = colorByAccuracy(acc);
+      const poly = L.polyline(coords, { color, weight: idx===0 ? 6 : 4, opacity:0.9 }).addTo(map);
+      routeLayers.push(poly);
+
+      const intensity = r.traffic_intensity || (route_signals[idx] && route_signals[idx][0] && route_signals[idx][0].intensity) || 40;
+      addRouteSignals(coords, intensity);
+
+      const popup = `<b>Route ${idx+1}</b><br>
+        Distance: ${r.distance_km ?? 'N/A'} km<br>
+        Duration: ${r.duration_min ?? 'N/A'} min<br>
+        Traffic: ${r.traffic_intensity}<br>
+        Road Quality: ${r.road_quality}<br>
+        ETA(ML): ${r.ml_eta_min} min<br>
+        Accuracy: ${r.accuracy_pct}%`;
+      poly.bindPopup(popup);
+
+      // create card
+      const card = document.createElement("div");
+      card.className = "route-card";
+      card.innerHTML = `<b>Route ${idx+1}</b><br>
+        Score/Acc: ${r.accuracy_pct ?? 'N/A'}<br>
+        Distance: ${r.distance_km ?? 'N/A'} km<br>
+        ETA: ${r.ml_eta_min ?? 'N/A'} min<br>
+        <button onclick="focusRoute(${idx})">Focus</button>`;
+      document.getElementById("routes").appendChild(card);
+    });
+
+    addCitySignals(city_signals);
+    drawHeat(heat_points);
+
+    if (routeLayers.length) map.fitBounds(routeLayers[0].getBounds());
+
+  } catch (err) {
+    console.error(err);
+    alert("Error fetching routes, check backend console.");
+    document.getElementById("status").textContent = "";
+  }
+}
+
+function focusRoute(i) {
+  if (!routeLayers[i]) return;
+  map.fitBounds(routeLayers[i].getBounds());
+}
+</script>
+</body>
+</html>
